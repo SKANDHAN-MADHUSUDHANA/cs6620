@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SecureShip platform stack (on-demand) - SAST API on Fargate behind an internal ALB, reached from API Gateway through a VPC Link
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secureship
+  VpcId:
+    Type: AWS::EC2::VPC::Id                 # default VPC for now; Akash's VPC later
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>        # two subnets in different AZs
+  LabRoleArn:
+    Type: String                            # Learner Lab: we cannot create IAM roles
+  ImageTag:
+    Type: String
+    Default: latest
+
+Resources:
+
+  # ---------- Security groups: VPC Link -> ALB -> task ----------
+  VpcLinkSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link
+      VpcId: !Ref VpcId
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal ALB - only from the VPC Link
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref VpcLinkSG
+
+  TaskSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Platform task - only from the ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSG
+
+  # ---------- Container on Fargate ----------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-platform"
+      RetentionInDays: 7
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-platform"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"                            # smallest size: 0.25 vCPU
+      Memory: "512"                         # 0.5 GB
+      ExecutionRoleArn: !Ref LabRoleArn     # pulls the image, writes logs
+      TaskRoleArn: !Ref LabRoleArn          # what the app can call (DynamoDB, S3)
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64             # matches --platform linux/amd64
+      ContainerDefinitions:
+        - Name: platform
+          Image: !Sub
+            - "${Repo}:${ImageTag}"
+            - Repo: !ImportValue
+                Fn::Sub: "${ProjectName}-RepoUri"
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: PORT
+              Value: "3000"
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: TABLE_NAME
+              Value: !ImportValue
+                Fn::Sub: "${ProjectName}-TableName"
+            - Name: BUCKET_NAME
+              Value: !ImportValue
+                Fn::Sub: "${ProjectName}-BucketName"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: platform
+
+  # ---------- Internal load balancer ----------
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-alb"
+      Scheme: internal                      # never faces the internet
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSG]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip                        # required for Fargate
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub "${ProjectName}-platform"
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref TaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSG]
+          AssignPublicIp: ENABLED           # temporary: pull from ECR without a NAT. TaskSG still blocks all inbound except the ALB
+      LoadBalancers:
+        - ContainerName: platform
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------- API Gateway -> VPC Link -> ALB ----------
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub "${ProjectName}-vpclink"
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds: [!Ref VpcLinkSG]
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: "${ProjectName}-ApiId"
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref Listener
+      PayloadFormatVersion: "1.0"
+
+  ProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !ImportValue
+        Fn::Sub: "${ProjectName}-ApiId"
+      RouteKey: "ANY /{proxy+}"
+      Target: !Sub "integrations/${Integration}"
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name

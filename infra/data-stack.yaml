@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: SecureShip data stack (always-on) - DynamoDB, S3, ECR, API Gateway
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: secureship
+
+Resources:
+
+  # 1. One table for projects, API keys, targets and scans
+  ScansTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-table"
+      BillingMode: PAY_PER_REQUEST          # on-demand: $0 when idle
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: openFlag
+          AttributeType: S
+        - AttributeName: queuedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH                     # partition key
+        - AttributeName: SK
+          KeyType: RANGE                    # sort key
+      GlobalSecondaryIndexes:
+        - IndexName: OpenScans              # sparse: only unfinished scans have openFlag
+          KeySchema:
+            - AttributeName: openFlag
+              KeyType: HASH
+            - AttributeName: queuedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+
+  # 2. Full JSON scan reports
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-reports-${AWS::AccountId}"   # bucket names must be globally unique
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # 3. Docker images for the platform API + SAST container
+  PlatformRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-platform"
+      ImageScanningConfiguration:
+        ScanOnPush: true                    # vulnerability scan on every push
+      EmptyOnDelete: true                   # lets the stack delete even if images exist
+
+  # 4. Public HTTPS front door (routes are added later by the platform stack)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50            # built-in throttling
+        ThrottlingRateLimit: 20
+
+Outputs:
+  TableName:
+    Value: !Ref ScansTable
+    Export:
+      Name: !Sub "${ProjectName}-TableName"
+  BucketName:
+    Value: !Ref ReportsBucket
+    Export:
+      Name: !Sub "${ProjectName}-BucketName"
+  RepoUri:
+    Value: !GetAtt PlatformRepo.RepositoryUri
+    Export:
+      Name: !Sub "${ProjectName}-RepoUri"
+  ApiId:
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub "${ProjectName}-ApiId"
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub "${ProjectName}-ApiUrl"
