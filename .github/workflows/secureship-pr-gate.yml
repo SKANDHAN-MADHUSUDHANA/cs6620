@@ -39,11 +39,7 @@ jobs:
               os.environ['API_URL'].rstrip('/') + '/scan/pr',
               data=json.dumps(body).encode(),
               headers={'Content-Type': 'application/json'})
-              try:
-                res = json.load(urllib.request.urlopen(req, timeout=25))
-              except urllib.error.HTTPError as e:
-                print(f'SecureShip API returned {e.code}: {e.read().decode()}')
-                sys.exit(1)
+          res = json.load(urllib.request.urlopen(req, timeout=25))
           s = res['summary']
           lines = [
               f"## SecureShip SAST: {'PASSED' if res['passed'] else 'FAILED'}",
