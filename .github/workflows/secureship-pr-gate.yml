@@ -1,0 +1,56 @@
+name: SecureShip PR gate
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed JavaScript files
+        run: |
+          git diff --name-only --diff-filter=AM origin/${{ github.base_ref }}...HEAD -- '*.js' '*.mjs' '*.cjs' '*.ts' > changed.txt || true
+          echo "Changed files:"; cat changed.txt
+
+      - name: Scan with SecureShip
+        env:
+          API_URL: ${{ secrets.SECURESHIP_API_URL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          files = [f.strip() for f in open('changed.txt') if f.strip()]
+          if not files:
+              print('No JavaScript files changed. Passing.')
+              sys.exit(0)
+          body = {
+              'projectId': 'demo',
+              'repo': os.environ['GITHUB_REPOSITORY'],
+              'pr': os.environ.get('PR_NUMBER', ''),
+              'commit': os.environ['GITHUB_SHA'],
+              'files': [{'filename': f, 'code': open(f, encoding='utf-8', errors='ignore').read()} for f in files],
+          }
+          req = urllib.request.Request(
+              os.environ['API_URL'].rstrip('/') + '/scan/pr',
+              data=json.dumps(body).encode(),
+              headers={'Content-Type': 'application/json'})
+          res = json.load(urllib.request.urlopen(req, timeout=25))
+          s = res['summary']
+          lines = [
+              f"## SecureShip SAST: {'PASSED' if res['passed'] else 'FAILED'}",
+              f"HIGH {s['high']} | MEDIUM {s['medium']} | LOW {s['low']} across {s['files']} file(s)",
+              f"Report saved to S3: `{res['reportKey']}`",
+              '',
+              '| Severity | File | Line | Issue |',
+              '|---|---|---|---|',
+          ]
+          lines += [f"| {v['severity']} | {v['file']} | {v['line']} | {v['description']} |" for v in res['findings']]
+          open(os.environ['GITHUB_STEP_SUMMARY'], 'a').write('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          sys.exit(0 if res['passed'] else 1)
+          PY
